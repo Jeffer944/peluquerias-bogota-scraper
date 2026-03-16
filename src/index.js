@@ -1,26 +1,38 @@
 const { chromium } = require('playwright');
 const { createObjectCsvWriter } = require('csv-writer');
+const { parse } = require('csv-parse/sync');
 const crypto = require('crypto');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const fs = require('fs');
 const path = require('path');
 
 const CSV_OUTPUT_PATH = process.env.CSV_OUTPUT_PATH
   || path.join(__dirname, '..', 'data', 'leads_export.csv');
 
-// ─── Constantes de umbral ────────────────────────────────────────────────────
+// ─── Configuración ───────────────────────────────────────────────────────────
 
-const THRESHOLD_LOW_REVIEWS = 50;
-const THRESHOLD_LOW_RATING = 4.2;
+const SEARCH_QUERY = process.env.SEARCH_QUERY || 'barberías norte de bogotá';
+const RESULT_LIMIT = parseInt(process.env.RESULT_LIMIT || '150', 10);
+
+// ─── Constantes ───────────────────────────────────────────────────────────────
+
+const SOCIAL_DOMAINS = [
+  'instagram.com',
+  'facebook.com',
+  'tiktok.com',
+  'wa.me',
+  'whatsapp.com',
+];
+
+const THRESHOLD_LOW_REVIEWS = 20;
 
 // ─── Limpieza y normalización ────────────────────────────────────────────────
 
 function cleanAddress(raw) {
   if (!raw) return '';
   return raw
-    .replace(/https?:\/\/\S+/gi, '')              // URLs
-    .replace(/@-?\d+\.\d+,\s*-?\d+\.\d+/g, '')   // @lat,lng (formato Google Maps)
-    .replace(/-?\d{1,3}\.\d{5,},\s*-?\d{1,3}\.\d{5,}/g, '') // coordenadas sueltas
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/@-?\d+\.\d+,\s*-?\d+\.\d+/g, '')
+    .replace(/-?\d{1,3}\.\d{5,},\s*-?\d{1,3}\.\d{5,}/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
@@ -30,147 +42,98 @@ function normalizePhone(raw) {
   const digits = raw.replace(/[^\d]/g, '');
   if (!digits) return raw.trim();
 
-  // Quitar prefijo de país 57 si viene con él
   let local = digits;
   if (local.startsWith('57') && local.length > 10) {
     local = local.slice(2);
   }
 
-  // Celular colombiano: 10 dígitos empezando en 3
   if (local.length === 10 && local.startsWith('3')) {
     return `+57 ${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
   }
 
-  // Bogotá fijo solo 7 dígitos (sin área)
   if (local.length === 7) {
     return `+57 601 ${local.slice(0, 3)} ${local.slice(3)}`;
   }
 
-  // Fijo con código de área 601 (10 dígitos)
   if (local.length === 10 && local.startsWith('601')) {
     return `+57 ${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
   }
 
-  // Fallback: devolver original limpio
   return raw.trim();
 }
 
-// ─── Análisis de sitio web ───────────────────────────────────────────────────
+function isSocialLink(url) {
+  if (!url) return false;
+  return SOCIAL_DOMAINS.some((domain) => url.includes(domain));
+}
 
-async function analyzeWebsite(url) {
-  // Regla 5: sin HTTPS (no requiere petición HTTP)
-  if (url.startsWith('http://')) {
-    return {
-      website_issue_type:    'no_https',
-      website_issue_details: 'El sitio no usa HTTPS y puede generar desconfianza en los usuarios',
-    };
-  }
+// ─── Detección de redes sociales ─────────────────────────────────────────────
 
-  let html;
-  try {
-    const response = await axios.get(url, {
-      timeout: 10000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SiteAudit/1.0)' },
-      maxRedirects: 5,
-    });
-    html = response.data;
-  } catch {
-    return {
-      website_issue_type:    'site_unreachable',
-      website_issue_details: 'No fue posible cargar el sitio web para analizarlo',
-    };
-  }
-
-  const $ = cheerio.load(html);
-  const bodyHtml = $.html().toLowerCase();
-  const bodyText = $('body').text().toLowerCase();
-
-  // Regla 1: sin botón de WhatsApp
-  if (!bodyHtml.includes('wa.me') && !bodyHtml.includes('whatsapp.com')) {
-    return {
-      website_issue_type:    'no_whatsapp_cta',
-      website_issue_details: 'El sitio no tiene botón visible para reservar por WhatsApp',
-    };
-  }
-
-  // Regla 2: sin CTA para agendar
-  const bookingKeywords = ['reservar', 'agendar', 'book', 'appointment'];
-  const hasBookingCta = bookingKeywords.some((kw) =>
-    $('a, button').toArray().some((el) => $(el).text().toLowerCase().includes(kw))
-  );
-  if (!hasBookingCta) {
-    return {
-      website_issue_type:    'no_booking_cta',
-      website_issue_details: 'El sitio no muestra llamadas claras para reservar o agendar citas',
-    };
-  }
-
-  // Regla 3: sin teléfono visible
-  if (!bodyHtml.includes('tel:') && !bodyText.includes('phone')) {
-    return {
-      website_issue_type:    'no_phone_visible',
-      website_issue_details: 'El sitio no muestra un teléfono visible para contacto rápido',
-    };
-  }
-
-  // Regla 4: sin dirección visible
-  const addressKeywords = ['dirección', 'address', 'ubicación', 'location'];
-  if (!addressKeywords.some((kw) => bodyText.includes(kw))) {
-    return {
-      website_issue_type:    'no_location_visible',
-      website_issue_details: 'El sitio no muestra claramente la dirección del negocio',
-    };
-  }
-
+function detectSocialLinks(website) {
+  if (!website) return { instagram: '', facebook: '', whatsapp: '' };
+  const lower = website.toLowerCase();
   return {
-    website_issue_type:    'no_issue_detected',
-    website_issue_details: 'No se detectaron problemas básicos automáticamente',
+    instagram: lower.includes('instagram.com') ? website : '',
+    facebook:  lower.includes('facebook.com')  ? website : '',
+    whatsapp:  lower.includes('wa.me') || lower.includes('whatsapp.com') ? website : '',
   };
 }
 
-// ─── Cálculo de oportunidad ──────────────────────────────────────────────────
+// ─── Scoring ─────────────────────────────────────────────────────────────────
 
-function computeOpportunity(record, websiteIssueType) {
-  const rating = parseFloat(record.rating) || 0;
-  const reviews = parseInt(record.reviews_count, 10) || 0;
-  const hasWebsite = record.website.length > 0;
-  const hasPhone = record.phone.length > 0;
-
-  const lowReviews = reviews < THRESHOLD_LOW_REVIEWS;
-  const lowRating = rating > 0 && rating < THRESHOLD_LOW_RATING;
-
-  // Puntuación aditiva (máx 10)
+function computeScore({ has_website, has_phone, has_email, reviews_count, rating }) {
   let score = 0;
-  if (!hasWebsite) score += 4;   // mayor necesidad: sin presencia web
-  if (lowReviews)  score += 3;   // poca visibilidad online
-  if (lowRating)   score += 2;   // reputación mejorable
-  if (hasPhone)    score += 1;   // contactable directamente
+  if (!has_website)                                score += 50;
+  if (has_phone)                                   score += 15;
+  if (has_email)                                   score += 10;
+  if ((parseInt(reviews_count, 10) || 0) >= 30)   score += 15;
+  if ((parseFloat(rating) || 0) >= 4.0)            score += 10;
+  return score;
+}
 
-  // Tipo de oportunidad según nueva lógica
-  let opportunity_type;
-  if (!hasWebsite) {
-    opportunity_type = 'no_website';
-  } else if (websiteIssueType && websiteIssueType !== 'no_issue_detected') {
-    opportunity_type = 'bad_website';
-  } else if (lowReviews) {
-    opportunity_type = 'low_reviews';
-  } else {
-    opportunity_type = 'establecido';
-  }
+// ─── Normalización del registro crudo ────────────────────────────────────────
+
+function normalizeRecord(raw) {
+  const address      = cleanAddress(raw.address);
+  const phone        = normalizePhone(raw.phone);
+  const mapsPlaceKey = extractMapsPlaceKey(raw.google_maps_url);
+
+  const hasPhone   = phone.length > 0;
+  const hasEmail   = false; // Google Maps no expone email
+  const hasWebsite = raw.website.length > 0 && !isSocialLink(raw.website);
+
+  const opportunityType = hasWebsite ? 'has_website' : 'no_website';
+  const flowType        = hasWebsite ? 'website_audit' : 'no_website_demo';
+
+  const score = computeScore({
+    has_website:   hasWebsite,
+    has_phone:     hasPhone,
+    has_email:     hasEmail,
+    reviews_count: raw.reviews_count,
+    rating:        raw.rating,
+  });
+
+  const reviews = parseInt(raw.reviews_count, 10) || 0;
+  const lowReviews = reviews < THRESHOLD_LOW_REVIEWS;
 
   return {
-    has_website:       hasWebsite ? 'true' : 'false',
-    low_reviews:       lowReviews ? 'true' : 'false',
-    low_rating:        lowRating  ? 'true' : 'false',
-    opportunity_score: score,
-    opportunity_type,
+    ...raw,
+    address,
+    phone,
+    maps_place_key:   mapsPlaceKey,
+    has_website:      hasWebsite,
+    has_email:        hasEmail,
+    has_phone:        hasPhone,
+    opportunity_type: opportunityType,
+    flow_type:        flowType,
+    score,
+    low_reviews:      lowReviews,
   };
 }
 
-// ─── Transformación al schema final del Google Sheet ─────────────────────────
+// ─── Transformación al schema del Google Sheet ────────────────────────────────
 
 function makeLeadId(name, address) {
-  // Hash estable: mismo negocio → mismo ID en re-runs
   return 'lead_' + crypto.createHash('md5').update(`${name}|${address}`).digest('hex').slice(0, 8);
 }
 
@@ -181,14 +144,7 @@ function nowString() {
 }
 
 function transformToLead(record) {
-  const hasWebsite  = record.has_website === 'true';
-  const hasPhone    = record.phone.length > 0;
-  // Score escalado 0-100 (el cálculo interno es 0-10, factor x10)
-  const score       = record.opportunity_score * 10;
-  // flow_type: sin web → demostración, con web → auditoría
-  const flowType    = !hasWebsite ? 'no_website_demo' : 'website_audit';
-  const ts          = nowString();
-
+  const ts = nowString();
   return {
     lead_id:              makeLeadId(record.name, record.address),
     business_name:        record.name,
@@ -201,15 +157,14 @@ function transformToLead(record) {
     email:                '',
     website:              record.website,
     google_maps_url:      record.google_maps_url,
-    has_website:          hasWebsite,
-    has_email:            false,
-    has_phone:            hasPhone,
-    score,
+    maps_place_key:       record.maps_place_key,
+    has_website:          record.has_website,
+    has_email:            record.has_email,
+    has_phone:            record.has_phone,
+    score:                record.score,
     opportunity_type:     record.opportunity_type,
-    website_issue_type:   record.website_issue_type   || '',
-    website_issue_details: record.website_issue_details || '',
-    flow_type:            flowType,
-    budget_qualified:     score >= 60,
+    flow_type:            record.flow_type,
+    budget_qualified:     record.score >= 60,
     status:               'new',
     demo_generated:       false,
     audit_generated:      false,
@@ -226,24 +181,49 @@ function transformToLead(record) {
   };
 }
 
-// ─── Enriquecimiento de un registro crudo ───────────────────────────────────
+// ─── Deduplicación ────────────────────────────────────────────────────────────
 
-async function enrichRecord(raw) {
-  const cleaned = {
-    ...raw,
-    address: cleanAddress(raw.address),
-    phone:   normalizePhone(raw.phone),
-  };
+// Extracts the stable hex place key embedded in Google Maps URLs.
+// Example: "0x8e3f9af5106ab819:0xb9cb5f3a1d4a906e"
+function extractMapsPlaceKey(url) {
+  if (!url) return '';
+  const m = url.match(/0x[0-9a-f]+:0x[0-9a-f]+/i);
+  return m ? m[0].toLowerCase() : '';
+}
 
-  const websiteAnalysis = cleaned.website
-    ? await analyzeWebsite(cleaned.website)
-    : { website_issue_type: '', website_issue_details: '' };
+// Lowercase + remove accents + collapse spaces — used for fallback keys.
+function normalizeText(str) {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-  return {
-    ...cleaned,
-    ...computeOpportunity(cleaned, websiteAnalysis.website_issue_type),
-    ...websiteAnalysis,
-  };
+// Returns the stable dedup key for a business.
+// Primary:  maps_place_key (hex id embedded in the URL)
+// Fallback: normalized name + address (when the hex key is absent)
+function makeDedupeKey(mapsPlaceKey, name, address) {
+  if (mapsPlaceKey) return `key:${mapsPlaceKey}`;
+  return `fb:${normalizeText(name)}|${normalizeText(address)}`;
+}
+
+function loadExistingKeys() {
+  const seen = new Set();
+  if (!fs.existsSync(CSV_OUTPUT_PATH)) return seen;
+
+  const content = fs.readFileSync(CSV_OUTPUT_PATH, 'utf8');
+  const records = parse(content, { columns: true, skip_empty_lines: true });
+  for (const row of records) {
+    // Prefer the stored maps_place_key column; fall back to recomputing from the URL.
+    const placeKey =
+      row.maps_place_key || extractMapsPlaceKey(row.google_maps_url || '');
+    const key = makeDedupeKey(placeKey, row.business_name, row.address);
+    if (key) seen.add(key);
+  }
+  return seen;
 }
 
 // ─── Scraping ────────────────────────────────────────────────────────────────
@@ -344,14 +324,19 @@ async function extractPlaceDetails(page) {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  const csvExistedAtStart = fs.existsSync(CSV_OUTPUT_PATH);
+  const existingKeys = loadExistingKeys();
+  console.log(`Claves existentes en CSV: ${existingKeys.size}`);
+
   const browser = await chromium.launch({
     headless: process.env.HEADLESS !== 'false',
     slowMo: process.env.HEADLESS !== 'false' ? 0 : 200,
   });
   const page = await browser.newPage();
 
-  const searchUrl =
-    'https://www.google.com/maps/search/peluquer%C3%ADas+en+Bogot%C3%A1';
+  console.log(`\nStarting scrape\nQuery: ${SEARCH_QUERY}\nLimit: ${RESULT_LIMIT} businesses\n`);
+
+  const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(SEARCH_QUERY)}`;
 
   await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   console.log('Página de búsqueda abierta');
@@ -374,13 +359,23 @@ async function main() {
     }
   }
 
-  const urlList = [...urls].slice(0, 20);
-  console.log(`URLs únicas a visitar: ${urlList.length} (límite de prueba: 20)`);
+  const urlList = [...urls].slice(0, RESULT_LIMIT);
+  console.log(`URLs únicas a visitar: ${urlList.length} (límite: ${RESULT_LIMIT})`);
 
   const scraped = [];
+  let skipped = 0;
 
   for (let i = 0; i < urlList.length; i++) {
     const url = urlList[i];
+
+    // Early skip: check place key extracted from feed URL before even visiting the page
+    const earlyKey = extractMapsPlaceKey(url);
+    if (earlyKey && existingKeys.has(`key:${earlyKey}`)) {
+      console.log(`[${i + 1}/${urlList.length}] DUPLICADO (feed key) — omitido`);
+      skipped++;
+      continue;
+    }
+
     console.log(`[${i + 1}/${urlList.length}] ${url.substring(0, 80)}...`);
 
     try {
@@ -388,10 +383,19 @@ async function main() {
       const raw = await extractPlaceDetails(page);
 
       if (raw.name) {
-        const record = await enrichRecord(raw);
+        const record = normalizeRecord(raw);
+        const dedupeKey = makeDedupeKey(record.maps_place_key, record.name, record.address);
+
+        if (existingKeys.has(dedupeKey)) {
+          console.log(`  ~ DUPLICADO (post-scrape) — omitido: ${record.name}`);
+          skipped++;
+          continue;
+        }
+
+        existingKeys.add(dedupeKey);
         scraped.push(record);
         console.log(
-          `  ✓ ${record.name} | ${record.rating}★ | ${record.reviews_count} reseñas | score:${record.opportunity_score} [${record.opportunity_type}] | web:${record.website_issue_type || 'n/a'}`
+          `  ✓ ${record.name} | ${record.rating}★ | ${record.reviews_count} reseñas | score:${record.score} [${record.opportunity_type}] | key:${record.maps_place_key || 'fallback'}`
         );
       }
     } catch (err) {
@@ -399,13 +403,32 @@ async function main() {
     }
   }
 
-  console.log(`\nTotal peluquerías extraídas: ${scraped.length}`);
+  console.log(`\nTotal nuevas peluquerías: ${scraped.length} | Duplicados omitidos: ${skipped}`);
 
-  // Ordenar por score descendente antes de transformar
-  scraped.sort((a, b) => b.opportunity_score - a.opportunity_score);
+  if (scraped.length === 0) {
+    console.log('Sin registros nuevos. CSV no modificado.');
+    await browser.close();
+    return;
+  }
 
-  // Transformar al schema final del Google Sheet
-  const leads = scraped.map((r) => transformToLead(r));
+  // Final dedup pass — safety net in case the same business appeared under
+  // different feed URLs within this run and slipped through the early check.
+  const seenThisRun = new Set();
+  const dedupedScrape = scraped.filter((r) => {
+    const key = makeDedupeKey(r.maps_place_key, r.name, r.address);
+    if (seenThisRun.has(key)) return false;
+    seenThisRun.add(key);
+    return true;
+  });
+
+  if (dedupedScrape.length < scraped.length) {
+    console.log(`Duplicados eliminados en paso final: ${scraped.length - dedupedScrape.length}`);
+  }
+
+  // Ordenar por score descendente
+  dedupedScrape.sort((a, b) => b.score - a.score);
+
+  const leads = dedupedScrape.map((r) => transformToLead(r));
 
   const csvWriter = createObjectCsvWriter({
     path: CSV_OUTPUT_PATH,
@@ -421,13 +444,12 @@ async function main() {
       { id: 'email',                title: 'email' },
       { id: 'website',              title: 'website' },
       { id: 'google_maps_url',      title: 'google_maps_url' },
+      { id: 'maps_place_key',       title: 'maps_place_key' },
       { id: 'has_website',          title: 'has_website' },
       { id: 'has_email',            title: 'has_email' },
       { id: 'has_phone',            title: 'has_phone' },
       { id: 'score',                title: 'score' },
-      { id: 'opportunity_type',      title: 'opportunity_type' },
-      { id: 'website_issue_type',   title: 'website_issue_type' },
-      { id: 'website_issue_details', title: 'website_issue_details' },
+      { id: 'opportunity_type',     title: 'opportunity_type' },
       { id: 'flow_type',            title: 'flow_type' },
       { id: 'budget_qualified',     title: 'budget_qualified' },
       { id: 'status',               title: 'status' },
@@ -444,14 +466,16 @@ async function main() {
       { id: 'created_at',           title: 'created_at' },
       { id: 'Updated_at',           title: 'Updated_at' },
     ],
+    append: csvExistedAtStart,
   });
 
   await csvWriter.writeRecords(leads);
-  console.log(`CSV guardado en ${CSV_OUTPUT_PATH} (${leads.length} leads)`);
+  console.log(`CSV guardado en ${CSV_OUTPUT_PATH} (${leads.length} leads nuevos)`);
 
   await browser.close();
 }
 
 main().catch((err) => {
   console.error('Error ejecutando el scraper:', err);
+  process.exit(1);
 });
