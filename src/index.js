@@ -8,6 +8,9 @@ const path = require('path');
 const CSV_OUTPUT_PATH = process.env.CSV_OUTPUT_PATH
   || path.join(__dirname, '..', 'data', 'leads_export.csv');
 
+const JSON_OUTPUT_PATH = process.env.JSON_OUTPUT_PATH
+  || path.join(__dirname, '..', 'data', 'leads_export.json');
+
 // ─── Configuración ───────────────────────────────────────────────────────────
 
 const SEARCH_QUERY = process.env.SEARCH_QUERY || 'barberías norte de bogotá';
@@ -471,6 +474,10 @@ async function main() {
 
   await csvWriter.writeRecords(leads);
   console.log(`CSV guardado en ${CSV_OUTPUT_PATH} (${leads.length} leads nuevos)`);
+
+  // JSON export — current run's leads only (n8n reads this to append to Sheets)
+  fs.writeFileSync(JSON_OUTPUT_PATH, JSON.stringify(leads, null, 2), 'utf8');
+  console.log(`JSON guardado en ${JSON_OUTPUT_PATH} (${leads.length} leads)`);
 
   await browser.close();
 }
