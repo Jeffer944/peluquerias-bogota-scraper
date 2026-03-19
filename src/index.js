@@ -1,4 +1,4 @@
-const { chromium } = require('playwright');
+const https = require('https');
 const { createObjectCsvWriter } = require('csv-writer');
 const { parse } = require('csv-parse/sync');
 const crypto = require('crypto');
@@ -13,8 +13,14 @@ const JSON_OUTPUT_PATH = process.env.JSON_OUTPUT_PATH
 
 // ─── Configuración ───────────────────────────────────────────────────────────
 
-const SEARCH_QUERY = process.env.SEARCH_QUERY || 'barberías norte de bogotá';
-const RESULT_LIMIT = parseInt(process.env.RESULT_LIMIT || '150', 10);
+const SEARCH_QUERY   = process.env.SEARCH_QUERY || 'barberías norte de bogotá';
+const RESULT_LIMIT   = parseInt(process.env.RESULT_LIMIT || '10', 10);
+const API_KEY        = process.env.GOOGLE_PLACES_API_KEY;
+
+if (!API_KEY) {
+  console.error('ERROR: falta GOOGLE_PLACES_API_KEY en el archivo .env');
+  process.exit(1);
+}
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
@@ -24,9 +30,78 @@ const SOCIAL_DOMAINS = [
   'tiktok.com',
   'wa.me',
   'whatsapp.com',
+  'linktr.ee',
 ];
 
-const THRESHOLD_LOW_REVIEWS = 20;
+// ─── HTTP helper ─────────────────────────────────────────────────────────────
+
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Google Places API ───────────────────────────────────────────────────────
+
+async function textSearch(query, pageToken = '') {
+  const params = new URLSearchParams({
+    query,
+    key:      API_KEY,
+    language: 'es',
+    region:   'co',
+  });
+  if (pageToken) params.set('pagetoken', pageToken);
+  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?${params}`;
+  return fetchJson(url);
+}
+
+async function placeDetails(placeId) {
+  const fields = [
+    'place_id', 'name', 'rating', 'user_ratings_total',
+    'formatted_phone_number', 'website', 'formatted_address', 'url',
+  ].join(',');
+  const params = new URLSearchParams({ place_id: placeId, fields, key: API_KEY, language: 'es' });
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
+  return fetchJson(url);
+}
+
+// Collects up to `limit` place_ids via Text Search (max 3 pages = 60 per query)
+async function collectPlaceIds(query, limit) {
+  const ids = [];
+  let pageToken = '';
+
+  for (let page = 0; page < 3 && ids.length < limit; page++) {
+    if (page > 0) await sleep(2000); // API requires delay between pages
+
+    const res = await textSearch(query, pageToken);
+
+    if (res.status !== 'OK' && res.status !== 'ZERO_RESULTS') {
+      console.error(`Text Search error: ${res.status} — ${res.error_message || ''}`);
+      break;
+    }
+
+    for (const place of (res.results || [])) {
+      if (ids.length >= limit) break;
+      ids.push(place.place_id);
+    }
+
+    pageToken = res.next_page_token || '';
+    if (!pageToken) break;
+  }
+
+  return ids;
+}
 
 // ─── Limpieza y normalización ────────────────────────────────────────────────
 
@@ -46,91 +121,65 @@ function normalizePhone(raw) {
   if (!digits) return raw.trim();
 
   let local = digits;
-  if (local.startsWith('57') && local.length > 10) {
-    local = local.slice(2);
-  }
+  if (local.startsWith('57') && local.length > 10) local = local.slice(2);
 
-  if (local.length === 10 && local.startsWith('3')) {
+  if (local.length === 10 && local.startsWith('3'))
     return `+57 ${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
-  }
-
-  if (local.length === 7) {
+  if (local.length === 7)
     return `+57 601 ${local.slice(0, 3)} ${local.slice(3)}`;
-  }
-
-  if (local.length === 10 && local.startsWith('601')) {
+  if (local.length === 10 && local.startsWith('601'))
     return `+57 ${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
-  }
 
   return raw.trim();
 }
 
 function isSocialLink(url) {
   if (!url) return false;
-  return SOCIAL_DOMAINS.some((domain) => url.includes(domain));
-}
-
-// ─── Detección de redes sociales ─────────────────────────────────────────────
-
-function detectSocialLinks(website) {
-  if (!website) return { instagram: '', facebook: '', whatsapp: '' };
-  const lower = website.toLowerCase();
-  return {
-    instagram: lower.includes('instagram.com') ? website : '',
-    facebook:  lower.includes('facebook.com')  ? website : '',
-    whatsapp:  lower.includes('wa.me') || lower.includes('whatsapp.com') ? website : '',
-  };
+  return SOCIAL_DOMAINS.some((d) => url.includes(d));
 }
 
 // ─── Scoring ─────────────────────────────────────────────────────────────────
 
 function computeScore({ has_website, has_phone, has_email, reviews_count, rating }) {
   let score = 0;
-  if (!has_website)                                score += 50;
-  if (has_phone)                                   score += 15;
-  if (has_email)                                   score += 10;
-  if ((parseInt(reviews_count, 10) || 0) >= 30)   score += 15;
-  if ((parseFloat(rating) || 0) >= 4.0)            score += 10;
+  if (!has_website)          score += 50;
+  if (has_phone)             score += 15;
+  if (has_email)             score += 10;
+  if (reviews_count >= 30)   score += 15;
+  if (rating >= 4.0)         score += 10;
   return score;
 }
 
 // ─── Normalización del registro crudo ────────────────────────────────────────
 
 function normalizeRecord(raw) {
-  const address      = cleanAddress(raw.address);
-  const phone        = normalizePhone(raw.phone);
-  const mapsPlaceKey = extractMapsPlaceKey(raw.google_maps_url);
-
-  const hasPhone   = phone.length > 0;
-  const hasEmail   = false; // Google Maps no expone email
-  const hasWebsite = raw.website.length > 0 && !isSocialLink(raw.website);
+  const address    = cleanAddress(raw.address);
+  const phone      = normalizePhone(raw.phone);
+  const hasPhone       = phone.length > 0;
+  const hasEmail       = false;
+  const hasSocialMedia = raw.website.length > 0 && isSocialLink(raw.website);
+  const hasWebsite     = raw.website.length > 0 && !hasSocialMedia;
+  const reviews    = parseInt(raw.reviews_count, 10) || 0;
+  const rating     = parseFloat(raw.rating) || 0;
 
   const opportunityType = hasWebsite ? 'has_website' : 'no_website';
   const flowType        = hasWebsite ? 'website_audit' : 'no_website_demo';
 
-  const score = computeScore({
-    has_website:   hasWebsite,
-    has_phone:     hasPhone,
-    has_email:     hasEmail,
-    reviews_count: raw.reviews_count,
-    rating:        raw.rating,
-  });
-
-  const reviews = parseInt(raw.reviews_count, 10) || 0;
-  const lowReviews = reviews < THRESHOLD_LOW_REVIEWS;
+  const score = computeScore({ has_website: hasWebsite, has_phone: hasPhone, has_email: hasEmail, reviews_count: reviews, rating });
 
   return {
     ...raw,
     address,
     phone,
-    maps_place_key:   mapsPlaceKey,
+    rating,
+    reviews_count:    reviews,
     has_website:      hasWebsite,
+    has_social_media: hasSocialMedia,
     has_email:        hasEmail,
     has_phone:        hasPhone,
     opportunity_type: opportunityType,
     flow_type:        flowType,
     score,
-    low_reviews:      lowReviews,
   };
 }
 
@@ -162,12 +211,15 @@ function transformToLead(record) {
     google_maps_url:      record.google_maps_url,
     maps_place_key:       record.maps_place_key,
     has_website:          record.has_website,
+    has_social_media:     record.has_social_media,
     has_email:            record.has_email,
     has_phone:            record.has_phone,
     score:                record.score,
     opportunity_type:     record.opportunity_type,
     flow_type:            record.flow_type,
-    budget_qualified:     record.score >= 60,
+    budget_qualified:     record.has_website
+      ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
+      : (record.reviews_count >= 40 && record.has_phone),
     status:               'new',
     demo_generated:       false,
     audit_generated:      false,
@@ -186,142 +238,26 @@ function transformToLead(record) {
 
 // ─── Deduplicación ────────────────────────────────────────────────────────────
 
-// Extracts the stable hex place key embedded in Google Maps URLs.
-// Example: "0x8e3f9af5106ab819:0xb9cb5f3a1d4a906e"
-function extractMapsPlaceKey(url) {
-  if (!url) return '';
-  const m = url.match(/0x[0-9a-f]+:0x[0-9a-f]+/i);
-  return m ? m[0].toLowerCase() : '';
-}
-
-// Lowercase + remove accents + collapse spaces — used for fallback keys.
 function normalizeText(str) {
   if (!str) return '';
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-// Returns the stable dedup key for a business.
-// Primary:  maps_place_key (hex id embedded in the URL)
-// Fallback: normalized name + address (when the hex key is absent)
-function makeDedupeKey(mapsPlaceKey, name, address) {
-  if (mapsPlaceKey) return `key:${mapsPlaceKey}`;
+function makeDedupeKey(placeId, name, address) {
+  if (placeId) return `pid:${placeId}`;
   return `fb:${normalizeText(name)}|${normalizeText(address)}`;
 }
 
 function loadExistingKeys() {
   const seen = new Set();
   if (!fs.existsSync(CSV_OUTPUT_PATH)) return seen;
-
   const content = fs.readFileSync(CSV_OUTPUT_PATH, 'utf8');
   const records = parse(content, { columns: true, skip_empty_lines: true });
   for (const row of records) {
-    // Prefer the stored maps_place_key column; fall back to recomputing from the URL.
-    const placeKey =
-      row.maps_place_key || extractMapsPlaceKey(row.google_maps_url || '');
-    const key = makeDedupeKey(placeKey, row.business_name, row.address);
+    const key = makeDedupeKey(row.maps_place_key, row.business_name, row.address);
     if (key) seen.add(key);
   }
   return seen;
-}
-
-// ─── Scraping ────────────────────────────────────────────────────────────────
-
-async function autoScroll(page) {
-  console.log('Iniciando scroll del panel...');
-  const feed = page.locator('div[role="feed"]');
-
-  let lastCount = 0;
-  let stableRounds = 0;
-
-  for (let i = 0; i < 25; i++) {
-    await feed.evaluate((el) => el.scrollBy(0, 2000));
-    console.log(`Scroll ${i + 1}`);
-    await page.waitForTimeout(2000);
-
-    const reachedEnd = await page
-      .locator('text=Has llegado al final de la lista')
-      .isVisible()
-      .catch(() => false);
-    if (reachedEnd) {
-      console.log('Fin de lista alcanzado.');
-      break;
-    }
-
-    const count = await page
-      .locator('div[role="feed"] a[href*="/maps/place/"]')
-      .count();
-
-    if (count === lastCount) {
-      stableRounds++;
-      if (stableRounds >= 3) break;
-    } else {
-      stableRounds = 0;
-      lastCount = count;
-    }
-  }
-}
-
-async function extractPlaceDetails(page) {
-  await page.waitForSelector('h1', { timeout: 15000 });
-  await page.waitForTimeout(1500);
-
-  const name = await page
-    .locator('h1')
-    .first()
-    .innerText()
-    .catch(() => '');
-
-  const rating = await page
-    .locator('div.F7nice span[aria-hidden="true"]')
-    .first()
-    .innerText()
-    .catch(() => '');
-
-  let reviews_count = '';
-  const reviewsLabel = await page
-    .locator('div.F7nice span[aria-label]')
-    .first()
-    .getAttribute('aria-label')
-    .catch(() => '');
-  if (reviewsLabel) {
-    const m = reviewsLabel.match(/[\d.,]+/);
-    if (m) reviews_count = m[0].replace(/\./g, '').replace(',', '');
-  }
-
-  const address = await page
-    .locator('button[data-item-id="address"] .Io6YTe')
-    .first()
-    .innerText()
-    .catch(() => '');
-
-  const phone = await page
-    .locator('[data-item-id^="phone:tel"] .Io6YTe')
-    .first()
-    .innerText()
-    .catch(() => '');
-
-  const website = await page
-    .locator('a[data-item-id="authority"]')
-    .first()
-    .getAttribute('href')
-    .catch(() => '');
-
-  const google_maps_url = page.url();
-
-  return {
-    name:          name.trim(),
-    rating:        rating.trim().replace(',', '.'),
-    reviews_count: reviews_count.trim(),
-    address:       address.trim(),
-    phone:         phone.trim(),
-    website:       (website || '').trim(),
-    google_maps_url,
-  };
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -330,108 +266,88 @@ async function main() {
   const csvExistedAtStart = fs.existsSync(CSV_OUTPUT_PATH);
   const existingKeys = loadExistingKeys();
   console.log(`Claves existentes en CSV: ${existingKeys.size}`);
+  console.log(`\nQuery: "${SEARCH_QUERY}" | Límite: ${RESULT_LIMIT}\n`);
 
-  const browser = await chromium.launch({
-    headless: process.env.HEADLESS !== 'false',
-    slowMo: process.env.HEADLESS !== 'false' ? 0 : 200,
-  });
-  const page = await browser.newPage();
-
-  console.log(`\nStarting scrape\nQuery: ${SEARCH_QUERY}\nLimit: ${RESULT_LIMIT} businesses\n`);
-
-  const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(SEARCH_QUERY)}`;
-
-  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  console.log('Página de búsqueda abierta');
-  await page.waitForTimeout(5000);
-
-  await autoScroll(page);
-
-  const linkLocator = page.locator('div[role="feed"] a[href*="/maps/place/"]');
-  const total = await linkLocator.count();
-  console.log(`Tarjetas detectadas en feed: ${total}`);
-
-  const urls = new Set();
-  for (let i = 0; i < total; i++) {
-    const href = await linkLocator.nth(i).getAttribute('href').catch(() => null);
-    if (href) {
-      const fullUrl = href.startsWith('http')
-        ? href
-        : `https://www.google.com${href}`;
-      urls.add(fullUrl);
-    }
-  }
-
-  const urlList = [...urls].slice(0, RESULT_LIMIT);
-  console.log(`URLs únicas a visitar: ${urlList.length} (límite: ${RESULT_LIMIT})`);
+  // 1. Recopilar place_ids via Text Search
+  console.log('Buscando negocios via Places API...');
+  const placeIds = await collectPlaceIds(SEARCH_QUERY, RESULT_LIMIT);
+  console.log(`place_ids encontrados: ${placeIds.length}\n`);
 
   const scraped = [];
   let skipped = 0;
 
-  for (let i = 0; i < urlList.length; i++) {
-    const url = urlList[i];
+  // 2. Obtener detalles de cada negocio
+  for (let i = 0; i < placeIds.length; i++) {
+    const placeId = placeIds[i];
+    const dedupeKey = makeDedupeKey(placeId, '', '');
 
-    // Early skip: check place key extracted from feed URL before even visiting the page
-    const earlyKey = extractMapsPlaceKey(url);
-    if (earlyKey && existingKeys.has(`key:${earlyKey}`)) {
-      console.log(`[${i + 1}/${urlList.length}] DUPLICADO (feed key) — omitido`);
+    if (existingKeys.has(dedupeKey)) {
+      console.log(`[${i + 1}/${placeIds.length}] DUPLICADO — omitido (${placeId})`);
       skipped++;
       continue;
     }
 
-    console.log(`[${i + 1}/${urlList.length}] ${url.substring(0, 80)}...`);
-
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      const raw = await extractPlaceDetails(page);
+      const res = await placeDetails(placeId);
 
-      if (raw.name) {
-        const record = normalizeRecord(raw);
-        const dedupeKey = makeDedupeKey(record.maps_place_key, record.name, record.address);
-
-        if (existingKeys.has(dedupeKey)) {
-          console.log(`  ~ DUPLICADO (post-scrape) — omitido: ${record.name}`);
-          skipped++;
-          continue;
-        }
-
-        existingKeys.add(dedupeKey);
-        scraped.push(record);
-        console.log(
-          `  ✓ ${record.name} | ${record.rating}★ | ${record.reviews_count} reseñas | score:${record.score} [${record.opportunity_type}] | key:${record.maps_place_key || 'fallback'}`
-        );
+      if (res.status !== 'OK') {
+        console.log(`[${i + 1}/${placeIds.length}] ERROR details: ${res.status}`);
+        continue;
       }
+
+      const p = res.result;
+      const raw = {
+        name:          (p.name || '').trim(),
+        rating:        p.rating || 0,
+        reviews_count: p.user_ratings_total || 0,
+        address:       (p.formatted_address || '').trim(),
+        phone:         (p.formatted_phone_number || '').trim(),
+        website:       (p.website || '').trim(),
+        google_maps_url: p.url || '',
+        maps_place_key:  p.place_id || placeId,
+      };
+
+      if (!raw.name) continue;
+
+      const record = normalizeRecord(raw);
+      const fullKey = makeDedupeKey(record.maps_place_key, record.name, record.address);
+
+      if (existingKeys.has(fullKey)) {
+        console.log(`  ~ DUPLICADO (post-fetch) — omitido: ${record.name}`);
+        skipped++;
+        continue;
+      }
+
+      existingKeys.add(fullKey);
+      scraped.push(record);
+
+      const qualified = record.has_website
+        ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
+        : (record.reviews_count >= 40 && record.has_phone);
+
+      console.log(
+        `[${i + 1}/${placeIds.length}] ✓ ${record.name}` +
+        ` | rating:${record.rating} | reviews_count:${record.reviews_count}` +
+        ` | web:${record.has_website} | phone:${record.has_phone} | qualified:${qualified}`
+      );
+
     } catch (err) {
-      console.log(`  ✗ Error en ficha ${i + 1}: ${err.message}`);
+      console.log(`[${i + 1}/${placeIds.length}] ✗ Error: ${err.message}`);
     }
+
+    // Pequeña pausa para no saturar la API
+    await sleep(200);
   }
 
-  console.log(`\nTotal nuevas peluquerías: ${scraped.length} | Duplicados omitidos: ${skipped}`);
+  console.log(`\nTotal nuevos: ${scraped.length} | Duplicados omitidos: ${skipped}`);
 
   if (scraped.length === 0) {
     console.log('Sin registros nuevos. CSV no modificado.');
-    await browser.close();
     return;
   }
 
-  // Final dedup pass — safety net in case the same business appeared under
-  // different feed URLs within this run and slipped through the early check.
-  const seenThisRun = new Set();
-  const dedupedScrape = scraped.filter((r) => {
-    const key = makeDedupeKey(r.maps_place_key, r.name, r.address);
-    if (seenThisRun.has(key)) return false;
-    seenThisRun.add(key);
-    return true;
-  });
-
-  if (dedupedScrape.length < scraped.length) {
-    console.log(`Duplicados eliminados en paso final: ${scraped.length - dedupedScrape.length}`);
-  }
-
-  // Ordenar por score descendente
-  dedupedScrape.sort((a, b) => b.score - a.score);
-
-  const leads = dedupedScrape.map((r) => transformToLead(r));
+  scraped.sort((a, b) => b.score - a.score);
+  const leads = scraped.map((r) => transformToLead(r));
 
   const csvWriter = createObjectCsvWriter({
     path: CSV_OUTPUT_PATH,
@@ -449,6 +365,7 @@ async function main() {
       { id: 'google_maps_url',      title: 'google_maps_url' },
       { id: 'maps_place_key',       title: 'maps_place_key' },
       { id: 'has_website',          title: 'has_website' },
+      { id: 'has_social_media',     title: 'has_social_media' },
       { id: 'has_email',            title: 'has_email' },
       { id: 'has_phone',            title: 'has_phone' },
       { id: 'score',                title: 'score' },
@@ -475,11 +392,8 @@ async function main() {
   await csvWriter.writeRecords(leads);
   console.log(`CSV guardado en ${CSV_OUTPUT_PATH} (${leads.length} leads nuevos)`);
 
-  // JSON export — current run's leads only (n8n reads this to append to Sheets)
   fs.writeFileSync(JSON_OUTPUT_PATH, JSON.stringify(leads, null, 2), 'utf8');
   console.log(`JSON guardado en ${JSON_OUTPUT_PATH} (${leads.length} leads)`);
-
-  await browser.close();
 }
 
 main().catch((err) => {
