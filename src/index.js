@@ -73,7 +73,7 @@ async function placeDetails(placeId) {
     'place_id', 'name', 'rating', 'user_ratings_total',
     'formatted_phone_number', 'website', 'formatted_address', 'url', 'reviews',
   ].join(',');
-  const params = new URLSearchParams({ place_id: placeId, fields, key: API_KEY, language: 'es' });
+  const params = new URLSearchParams({ place_id: placeId, fields, key: API_KEY, language: 'es', reviews_sort: 'newest' });
   const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
   return fetchJson(url);
 }
@@ -110,7 +110,7 @@ async function collectPlaceIds(query, limit) {
 function summarizeNegativeReviews(reviews) {
   if (!reviews || reviews.length === 0) return '';
 
-  const negative = reviews.filter((r) => r.rating <= 3 && r.text && r.text.trim().length > 0);
+  const negative = reviews.filter((r) => r.rating <= 4 && r.text && r.text.trim().length > 0);
   if (negative.length === 0) return '';
 
   // Junta todos los textos negativos y extrae hasta 2 oraciones reales
