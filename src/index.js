@@ -17,7 +17,7 @@ const RESULT_LIMIT   = parseInt(process.env.RESULT_LIMIT || '10', 10);
 const SEARCH_QUERIES = process.env.SEARCH_QUERIES
   ? process.env.SEARCH_QUERIES.split(',').map((q) => q.trim()).filter(Boolean)
   : [process.env.SEARCH_QUERY || 'barberías norte de bogotá'];
-const API_KEY        = process.env.GOOGLE_PLACES_API_KEY;
+const API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 
 if (!API_KEY) {
   console.error('ERROR: falta GOOGLE_PLACES_API_KEY en el archivo .env');
@@ -71,7 +71,7 @@ async function textSearch(query, pageToken = '') {
 async function placeDetails(placeId) {
   const fields = [
     'place_id', 'name', 'rating', 'user_ratings_total',
-    'formatted_phone_number', 'website', 'formatted_address', 'url',
+    'formatted_phone_number', 'website', 'formatted_address', 'url', 'reviews',
   ].join(',');
   const params = new URLSearchParams({ place_id: placeId, fields, key: API_KEY, language: 'es' });
   const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
@@ -103,6 +103,24 @@ async function collectPlaceIds(query, limit) {
   }
 
   return ids;
+}
+
+// ─── Resumen de reseñas negativas ────────────────────────────────────────────
+
+function summarizeNegativeReviews(reviews) {
+  if (!reviews || reviews.length === 0) return '';
+
+  const negative = reviews.filter((r) => r.rating <= 3 && r.text && r.text.trim().length > 0);
+  if (negative.length === 0) return '';
+
+  // Junta todos los textos negativos y extrae hasta 2 oraciones reales
+  const allText = negative.map((r) => r.text.trim()).join(' ');
+  const sentences = allText
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 15);
+
+  return sentences.slice(0, 2).join(' ');
 }
 
 // ─── Limpieza y normalización ────────────────────────────────────────────────
@@ -174,14 +192,15 @@ function normalizeRecord(raw) {
     address,
     phone,
     rating,
-    reviews_count:    reviews,
-    has_website:      hasWebsite,
-    has_social_media: hasSocialMedia,
-    has_email:        hasEmail,
-    has_phone:        hasPhone,
-    opportunity_type: opportunityType,
-    flow_type:        flowType,
+    reviews_count:             reviews,
+    has_website:               hasWebsite,
+    has_social_media:          hasSocialMedia,
+    has_email:                 hasEmail,
+    has_phone:                 hasPhone,
+    opportunity_type:          opportunityType,
+    flow_type:                 flowType,
     score,
+    negative_reviews_summary:  raw.negative_reviews_summary || '',
   };
 }
 
@@ -232,9 +251,10 @@ function transformToLead(record) {
     last_contact_channel: 'none',
     last_contact_date:    '',
     contact_result:       '',
-    notes:                '',
-    created_at:           ts,
-    Updated_at:           ts,
+    notes:                    '',
+    negative_reviews_summary: record.negative_reviews_summary || '',
+    created_at:               ts,
+    Updated_at:               ts,
   };
 }
 
@@ -316,6 +336,7 @@ async function main() {
       }
 
       const p = res.result;
+      const negative_reviews_summary = summarizeNegativeReviews(p.reviews || []);
       const raw = {
         name:          (p.name || '').trim(),
         rating:        p.rating || 0,
@@ -325,6 +346,7 @@ async function main() {
         website:       (p.website || '').trim(),
         google_maps_url: p.url || '',
         maps_place_key:  p.place_id || placeId,
+        negative_reviews_summary,
       };
 
       if (!raw.name) continue;
@@ -402,9 +424,10 @@ async function main() {
       { id: 'last_contact_channel', title: 'last_contact_channel' },
       { id: 'last_contact_date',    title: 'last_contact_date' },
       { id: 'contact_result',       title: 'contact_result' },
-      { id: 'notes',                title: 'notes' },
-      { id: 'created_at',           title: 'created_at' },
-      { id: 'Updated_at',           title: 'Updated_at' },
+      { id: 'notes',                    title: 'notes' },
+      { id: 'negative_reviews_summary', title: 'negative_reviews_summary' },
+      { id: 'created_at',               title: 'created_at' },
+      { id: 'Updated_at',               title: 'Updated_at' },
     ],
     append: csvExistedAtStart,
   });
