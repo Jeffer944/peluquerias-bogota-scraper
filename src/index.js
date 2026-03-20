@@ -13,8 +13,10 @@ const JSON_OUTPUT_PATH = process.env.JSON_OUTPUT_PATH
 
 // ─── Configuración ───────────────────────────────────────────────────────────
 
-const SEARCH_QUERY   = process.env.SEARCH_QUERY || 'barberías norte de bogotá';
 const RESULT_LIMIT   = parseInt(process.env.RESULT_LIMIT || '10', 10);
+const SEARCH_QUERIES = process.env.SEARCH_QUERIES
+  ? process.env.SEARCH_QUERIES.split(',').map((q) => q.trim()).filter(Boolean)
+  : [process.env.SEARCH_QUERY || 'barberías norte de bogotá'];
 const API_KEY        = process.env.GOOGLE_PLACES_API_KEY;
 
 if (!API_KEY) {
@@ -266,12 +268,30 @@ async function main() {
   const csvExistedAtStart = fs.existsSync(CSV_OUTPUT_PATH);
   const existingKeys = loadExistingKeys();
   console.log(`Claves existentes en CSV: ${existingKeys.size}`);
-  console.log(`\nQuery: "${SEARCH_QUERY}" | Límite: ${RESULT_LIMIT}\n`);
+  console.log(`\nQueries: ${SEARCH_QUERIES.length} | Límite total: ${RESULT_LIMIT}\n`);
 
-  // 1. Recopilar place_ids via Text Search
-  console.log('Buscando negocios via Places API...');
-  const placeIds = await collectPlaceIds(SEARCH_QUERY, RESULT_LIMIT);
-  console.log(`place_ids encontrados: ${placeIds.length}\n`);
+  // 1. Recopilar place_ids via Text Search (todas las queries)
+  const allPlaceIds = [];
+  const seenPlaceIds = new Set();
+
+  for (const query of SEARCH_QUERIES) {
+    if (allPlaceIds.length >= RESULT_LIMIT) break;
+    console.log(`Buscando: "${query}"...`);
+    const remaining = RESULT_LIMIT - allPlaceIds.length;
+    const ids = await collectPlaceIds(query, remaining);
+    let added = 0;
+    for (const id of ids) {
+      if (!seenPlaceIds.has(id)) {
+        seenPlaceIds.add(id);
+        allPlaceIds.push(id);
+        added++;
+      }
+    }
+    console.log(`  → ${added} nuevos place_ids (total acumulado: ${allPlaceIds.length})\n`);
+  }
+
+  const placeIds = allPlaceIds;
+  console.log(`place_ids únicos encontrados: ${placeIds.length}\n`);
 
   const scraped = [];
   let skipped = 0;
