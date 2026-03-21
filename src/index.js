@@ -274,7 +274,7 @@ function loadExistingKeys() {
   const seen = new Set();
   if (!fs.existsSync(CSV_OUTPUT_PATH)) return seen;
   const content = fs.readFileSync(CSV_OUTPUT_PATH, 'utf8');
-  const records = parse(content, { columns: true, skip_empty_lines: true });
+  const records = parse(content, { columns: true, skip_empty_lines: true, relax_column_count: true });
   for (const row of records) {
     const key = makeDedupeKey(row.maps_place_key, row.business_name, row.address);
     if (key) seen.add(key);
