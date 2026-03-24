@@ -158,15 +158,21 @@ function isSocialLink(url) {
   return SOCIAL_DOMAINS.some((d) => url.includes(d));
 }
 
+// Detecta teléfonos fijos colombianos: +57 601..609
+function isFixedLine(phone) {
+  return /^\+57 60[1-9]/.test(phone);
+}
+
 // ─── Scoring ─────────────────────────────────────────────────────────────────
 
-function computeScore({ has_website, has_phone, has_email, reviews_count, rating }) {
+function computeScore({ has_website, has_phone, has_email, reviews_count, rating, is_fixed_line }) {
   let score = 0;
-  if (!has_website)          score += 50;
-  if (has_phone)             score += 15;
-  if (has_email)             score += 10;
-  if (reviews_count >= 30)   score += 15;
-  if (rating >= 4.0)         score += 10;
+  if (!has_website)                    score += 50;
+  if (has_phone)                       score += 15;
+  if (has_email)                       score += 10;
+  if (reviews_count >= 30)             score += 15;
+  if (rating >= 4.0)                   score += 10;
+  if (is_fixed_line && !has_website)   score -= 20;
   return score;
 }
 
@@ -179,13 +185,14 @@ function normalizeRecord(raw) {
   const hasEmail       = false;
   const hasSocialMedia = raw.website.length > 0 && isSocialLink(raw.website);
   const hasWebsite     = raw.website.length > 0 && !hasSocialMedia;
+  const hasFixedLine   = hasPhone && isFixedLine(phone);
   const reviews    = parseInt(raw.reviews_count, 10) || 0;
   const rating     = parseFloat(raw.rating) || 0;
 
   const opportunityType = hasWebsite ? 'has_website' : 'no_website';
   const flowType        = hasWebsite ? 'website_audit' : 'no_website_demo';
 
-  const score = computeScore({ has_website: hasWebsite, has_phone: hasPhone, has_email: hasEmail, reviews_count: reviews, rating });
+  const score = computeScore({ has_website: hasWebsite, has_phone: hasPhone, has_email: hasEmail, reviews_count: reviews, rating, is_fixed_line: hasFixedLine });
 
   return {
     ...raw,
@@ -197,6 +204,7 @@ function normalizeRecord(raw) {
     has_social_media:          hasSocialMedia,
     has_email:                 hasEmail,
     has_phone:                 hasPhone,
+    has_fixed_line:            hasFixedLine,
     opportunity_type:          opportunityType,
     flow_type:                 flowType,
     score,
@@ -238,9 +246,11 @@ function transformToLead(record) {
     score:                record.score,
     opportunity_type:     record.opportunity_type,
     flow_type:            record.flow_type,
-    budget_qualified:     record.has_website
-      ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
-      : (record.reviews_count >= 40 && record.has_phone),
+    budget_qualified:     (record.has_fixed_line && !record.has_website)
+      ? false
+      : record.has_website
+        ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
+        : (record.reviews_count >= 40 && record.has_phone),
     status:               'new',
     demo_generated:       false,
     audit_generated:      false,
@@ -363,9 +373,11 @@ async function main() {
       existingKeys.add(fullKey);
       scraped.push(record);
 
-      const qualified = record.has_website
-        ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
-        : (record.reviews_count >= 40 && record.has_phone);
+      const qualified = (record.has_fixed_line && !record.has_website)
+        ? false
+        : record.has_website
+          ? (record.reviews_count >= 50 && record.has_phone && record.rating >= 4.3)
+          : (record.reviews_count >= 40 && record.has_phone);
 
       console.log(
         `[${i + 1}/${placeIds.length}] ✓ ${record.name}` +
@@ -385,6 +397,8 @@ async function main() {
 
   if (scraped.length === 0) {
     console.log('Sin registros nuevos. CSV no modificado.');
+    fs.writeFileSync(JSON_OUTPUT_PATH, JSON.stringify([], null, 2), 'utf8');
+    console.log('JSON vaciado para evitar reinsertar datos rancios.');
     return;
   }
 
